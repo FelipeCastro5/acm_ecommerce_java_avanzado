@@ -185,7 +185,7 @@ jobs:
             .
 
       - name: Scan Docker image with Trivy
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: "acm-ecommerce:${{ steps.vars.outputs.short_sha }}"
           format: "table"
