@@ -1,0 +1,207 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ "main", "master" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+          cache: "gradle"
+
+      - name: Grant execute permission for Gradle wrapper
+        run: chmod +x ./gradlew
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Build application JAR
+        run: ./gradlew clean assemble -x test --no-daemon
+
+      - name: Upload build artifact (JAR)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-artifact
+          path: build/libs/*.jar
+          retention-days: 14
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+          cache: "gradle"
+
+      - name: Grant execute permission for Gradle wrapper
+        run: chmod +x ./gradlew
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Verify Secrets Context
+        run: |
+          echo "Verificando si los secrets estan llegando al runner..."
+          if [ -z "${{ secrets.DB_PASSWORD }}" ]; then
+            echo "ERROR: DB_PASSWORD esta vacio. GitHub no esta inyectando el secret."
+            exit 1
+          else
+            echo "DB_PASSWORD detectado correctamente."
+          fi
+
+      - name: Start PostgreSQL
+        run: |
+          docker run -d \
+            --name postgres \
+            -e POSTGRES_DB="${{ secrets.DB_NAME }}" \
+            -e POSTGRES_USER="${{ secrets.DB_USER }}" \
+            -e POSTGRES_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+            -p ${{ secrets.DB_PORT }}:5432 \
+            postgres:16-alpine
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in {1..15}; do
+            if docker exec postgres pg_isready -U "${{ secrets.DB_USER }}" > /dev/null 2>&1; then
+              echo "PostgreSQL is ready!"
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' postgres)" != "true" ]; then
+              echo "Container stopped unexpectedly. Logs:"
+              docker logs postgres
+              exit 1
+            fi
+            echo "Waiting..."
+            sleep 2
+          done
+          echo "Timed out waiting for PostgreSQL. Logs:"
+          docker logs postgres
+          exit 1
+
+      - name: Run tests
+        env:
+          SPRING_DATASOURCE_URL: ${{ secrets.SPRING_DATASOURCE_URL }}
+          SPRING_DATASOURCE_USERNAME: ${{ secrets.SPRING_DATASOURCE_USERNAME }}
+          SPRING_DATASOURCE_PASSWORD: ${{ secrets.SPRING_DATASOURCE_PASSWORD }}
+        run: ./gradlew test --no-daemon
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: build/reports/tests/**
+          retention-days: 14
+
+  codeql:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: java-kotlin
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  docker:
+    needs: [ build, test, codeql ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download build artifact (JAR)
+        uses: actions/download-artifact@v4
+        with:
+          name: application-artifact
+          path: build/libs
+
+      - name: Extract short SHA for semantic tagging
+        id: vars
+        run: |
+          echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "image_name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t acm-ecommerce:${{ steps.vars.outputs.short_sha }} \
+            -t acm-ecommerce:latest \
+            .
+
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "acm-ecommerce:${{ steps.vars.outputs.short_sha }}"
+          format: "table"
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+
+      - name: Push Docker image to GHCR
+        env:
+          REGISTRY: ghcr.io
+          IMAGE_NAME: ${{ steps.vars.outputs.image_name }}
+          SHORT_SHA: ${{ steps.vars.outputs.short_sha }}
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
+          docker tag acm-ecommerce:$SHORT_SHA $REGISTRY/$IMAGE_NAME:$SHORT_SHA
+          docker tag acm-ecommerce:latest $REGISTRY/$IMAGE_NAME:latest
+          docker push $REGISTRY/$IMAGE_NAME:$SHORT_SHA
+          docker push $REGISTRY/$IMAGE_NAME:latest
